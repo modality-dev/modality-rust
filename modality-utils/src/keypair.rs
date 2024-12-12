@@ -1,15 +1,14 @@
-use std::fs;
+use anyhow::{anyhow, Result};
+use base58::ToBase58;
 use libp2p::identity::{ed25519, Keypair as Libp2pKeypair, PublicKey as Libp2pPublicKey};
-use base58::{ToBase58};
-use serde::{Serialize, Deserialize};
-use serde_json::Value;
-use anyhow::{Result, anyhow};
-use regex::Regex;
 use libp2p_identity::PeerId;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::fs;
 
-use crate::json_stringify_deterministic::stringify_deterministic;
 use crate::encrypted_text::EncryptedText;
-
+use crate::json_stringify_deterministic::stringify_deterministic;
 
 #[derive(Clone)]
 pub enum KeypairOrPublicKey {
@@ -29,7 +28,7 @@ pub struct KeypairJSON {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub private_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub encrypted_private_key: Option<String>
+    pub encrypted_private_key: Option<String>,
 }
 
 impl KeypairJSON {
@@ -111,7 +110,9 @@ impl Keypair {
 
     pub fn private_key_as_base64_pad(&self) -> Result<String> {
         match &self.inner {
-            KeypairOrPublicKey::Keypair(k) => Ok(Self::uint8_array_as_base64_pad(&k.to_protobuf_encoding()?)),
+            KeypairOrPublicKey::Keypair(k) => {
+                Ok(Self::uint8_array_as_base64_pad(&k.to_protobuf_encoding()?))
+            }
             KeypairOrPublicKey::PublicKey(_) => Err(anyhow!("No private key available")),
         }
     }
@@ -131,18 +132,21 @@ impl Keypair {
 
     pub fn from_public_multiaddress(multiaddress: &str) -> Result<Self> {
         let re = Regex::new(r"^(.+)-pub/(.+)$").unwrap();
-        let captures = re.captures(multiaddress)
+        let captures = re
+            .captures(multiaddress)
             .ok_or_else(|| anyhow!("Invalid multiaddress format"))?;
 
         // let _key_type = captures.get(1)
         //     .ok_or_else(|| anyhow!("Failed to extract key type"))?
         //     .as_str();
-        let peer_id_str = captures.get(2)
+        let peer_id_str = captures
+            .get(2)
             .ok_or_else(|| anyhow!("Failed to extract public key ID"))?
             .as_str();
-    
+
         // Parse the peer ID
-        let peer_id = peer_id_str.parse::<PeerId>()
+        let peer_id = peer_id_str
+            .parse::<PeerId>()
             .map_err(|e| anyhow!("Failed to parse peer ID: {:?}", e))?;
 
         let public_key = libp2p::identity::PublicKey::try_decode_protobuf(&peer_id.to_bytes())
@@ -168,6 +172,26 @@ impl Keypair {
         Self::from_json(&json)
     }
 
+    pub fn from_encrypted_json_file(filepath: &str, password: &str) -> Result<Self> {
+        let json_str = fs::read_to_string(filepath)?;
+        let json: KeypairJSON = serde_json::from_str(&json_str)?;
+
+        println!("keypair json: {}", json_str);
+
+        if let Some(encrypted_key) = json.encrypted_private_key() {
+            let decrypted_key = EncryptedText::decrypt(encrypted_key, password).ok();
+            let decrypted_json = KeypairJSON {
+                id: json.id().to_string(),
+                public_key: json.public_key().to_string(),
+                private_key: decrypted_key,
+                encrypted_private_key: None,
+            };
+            Self::from_json(&decrypted_json)
+        } else {
+            Self::from_json(&json)
+        }
+    }
+
     pub fn from_json_file(filepath: &str) -> Result<Self> {
         let json_str = fs::read_to_string(filepath)?;
         Self::from_json_string(&json_str)
@@ -178,7 +202,7 @@ impl Keypair {
             id: self.public_key_as_base58_identity(),
             public_key: self.public_key_as_base64_pad(),
             private_key: None,
-            encrypted_private_key: None
+            encrypted_private_key: None,
         })
     }
 
@@ -194,11 +218,18 @@ impl Keypair {
     }
 
     pub fn as_json(&self) -> Result<KeypairJSON> {
+        let private_key = self.private_key_as_base64_pad().ok();
+        let encrypted_private_key = if private_key.is_some() {
+            None
+        } else {
+            Some("".to_string()) // Use actual encrypted_private_key if available
+        };
+
         Ok(KeypairJSON {
             id: self.public_key_as_base58_identity(),
             public_key: self.public_key_as_base64_pad(),
-            private_key: self.private_key_as_base64_pad().ok(),
-            encrypted_private_key: None
+            private_key,
+            encrypted_private_key,
         })
     }
 
@@ -219,7 +250,7 @@ impl Keypair {
             id: self.public_key_as_base58_identity(),
             public_key: self.public_key_as_base64_pad(),
             private_key: None,
-            encrypted_private_key: enc_pk
+            encrypted_private_key: enc_pk,
         })
     }
 
@@ -284,9 +315,14 @@ impl Keypair {
         self.verify_signature_for_string(signature, &str)
     }
 
-    pub fn verify_json_with_signature_key(&self, json: &Value, signature_key: &str) -> Result<bool> {
+    pub fn verify_json_with_signature_key(
+        &self,
+        json: &Value,
+        signature_key: &str,
+    ) -> Result<bool> {
         if let Value::Object(map) = json {
-            let signature = map.get(signature_key)
+            let signature = map
+                .get(signature_key)
                 .ok_or_else(|| anyhow!("Signature key not found"))?
                 .as_str()
                 .ok_or_else(|| anyhow!("Signature must be a string"))?;
@@ -312,9 +348,11 @@ impl Keypair {
                 if let Some(captures) = suffix_regex.captures(key) {
                     let original_key = captures.get(1).unwrap().as_str();
                     if let Some(original_value) = map.get(original_key) {
-                        let signature = value.as_str().ok_or_else(|| anyhow!("Signature must be a string"))?;
+                        let signature = value
+                            .as_str()
+                            .ok_or_else(|| anyhow!("Signature must be a string"))?;
                         let stringified = stringify_deterministic(original_value, None);
-                        
+
                         if !self.verify_signature_for_string(signature, &stringified)? {
                             return Ok(false);
                         }
